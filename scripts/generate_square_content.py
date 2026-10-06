@@ -841,7 +841,7 @@ def draw_coin_icon(draw, center, coin, theme):
     draw.text((cx - tw / 2, cy - th / 2 - 3), label, font=f, fill=(250, 250, 252))
 
 
-def build_visual(data, market, news, background, model_used):
+def build_visual(data, market, news, background_img, model_used, background_meta=None):
     W, H = 1920, 1080
     sentiment = str(data.get("sentiment", "neutral")).lower()
     coin = str(data.get("coin", "")).upper().strip()
@@ -850,8 +850,8 @@ def build_visual(data, market, news, background, model_used):
 
     base = gradient_background((W, H), theme).convert("RGBA")
 
-    if background:
-        photo = crop_cover(background, (W, H))
+    if background_img:
+        photo = crop_cover(background_img, (W, H))
         photo = color_grade_background(photo, theme)
         base.alpha_composite(photo)
     else:
@@ -1030,8 +1030,8 @@ def build_visual(data, market, news, background, model_used):
             source_names.append(item["source"])
     source_text = "Sources: " + " • ".join(source_names[:4]) if source_names else "Sources: Editorial / educational"
     draw.text((70, 1062), source_text[:150], font=f["small"], fill=(144, 158, 178))
-    if background:
-        credit = f"Visual source: Wikimedia Commons • {background['license'][:28]}"
+    if background_meta:
+        credit = f"Visual source: Wikimedia Commons • {background_meta.get('license', 'free-license')[:28]}"
     else:
         credit = "Visual source: deterministic graphic composition"
     cb = draw.textbbox((0, 0), credit, font=f["small"])
@@ -1137,7 +1137,7 @@ def main():
     else:
         print("No suitable Commons photo found; using deterministic graphic background.")
 
-    theme_key = build_visual(data, market, news, bg_img, model_used)
+    theme_key = build_visual(data, market, news, bg_img, model_used, background_meta=background)
 
     with open("content.txt", "w", encoding="utf-8") as f:
         f.write(content)
