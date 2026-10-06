@@ -36,6 +36,22 @@ jobs:
       EVENT_SCHEDULE: ${{ github.event.schedule }}
 
     steps:
+      # Required: GitHub Actions runners start in a clean workspace.
+      # Checkout makes the repository's scripts/ directory available.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify repository files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/binance-square-auto-poster.yml
+          test -f scripts/generate_square_content.py
+          echo "Repository checkout verified."
+          echo "Generator: scripts/generate_square_content.py"
+
       - name: Select mode
         shell: bash
         run: |
@@ -58,11 +74,21 @@ jobs:
             esac
           fi
 
+          case "$MODE" in
+            news|education|article) ;;
+            *)
+              echo "Unsupported mode: $MODE"
+              exit 1
+              ;;
+          esac
+
           echo "CONTENT_MODE=$MODE" >> "$GITHUB_ENV"
           echo "Mode: $MODE"
 
       - name: Install image and feed tools
+        shell: bash
         run: |
+          set -euo pipefail
           python3 -m pip install --disable-pip-version-check --no-cache-dir Pillow
 
       - name: Generate editorial content + V5 premium visual
@@ -71,11 +97,23 @@ jobs:
           set -euo pipefail
           python3 scripts/generate_square_content.py
 
+          test -s content.txt
+          test -s square_visual.jpg
+
+          if [ "$CONTENT_MODE" = "article" ]; then
+            test -s title.txt
+            test -s article_cover.jpg
+          fi
+
+          echo "Generation outputs verified."
+
       - name: Download official Binance Square skill
+        shell: bash
         run: |
           set -euo pipefail
           git clone --depth 1 https://github.com/binance/binance-skills-hub.git
           node --version
+          test -f binance-skills-hub/skills/binance/square-post/scripts/post-image.mjs
 
       - name: Publish to Binance Square
         shell: bash
@@ -123,6 +161,9 @@ jobs:
             echo "- Visual: 1920×1080 JPEG"
             if [ -f visual_theme.txt ]; then
               echo "- Visual theme: \`$(cat visual_theme.txt)\`"
+            fi
+            if [ -f visual_source.txt ]; then
+              echo "- Visual source: $(cat visual_source.txt)"
             fi
             echo "- Image engine: premium deterministic composition + post-processing"
             echo "- Template engine: structured editorial layout"
