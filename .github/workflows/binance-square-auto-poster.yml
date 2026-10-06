@@ -1,4 +1,4 @@
-name: Binance Square Auto Publisher V4
+name: Binance Square Auto Publisher V4.1
 
 on:
   workflow_dispatch:
@@ -32,7 +32,6 @@ jobs:
 
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
       INPUT_MODE: ${{ inputs.mode }}
       EVENT_SCHEDULE: ${{ github.event.schedule }}
 
@@ -172,7 +171,7 @@ jobs:
           def feed_items(source, url):
               req = urllib.request.Request(
                   url,
-                  headers={"User-Agent": "Mozilla/5.0 BinanceSquareV4/1.0"}
+                  headers={"User-Agent": "Mozilla/5.0 BinanceSquareV4.1/1.0"}
               )
               try:
                   with urllib.request.urlopen(req, timeout=20) as r:
@@ -645,13 +644,17 @@ jobs:
           else:
               must.append("#CryptoAnalysis")
 
-          for tag in must:
-              if tag.lower() not in {
-                  x.lower() for x in tags
+          # Binance Square hashtag safety: keep the final payload at 5 max.
+          final_tags = []
+          for tag in must + tags:
+              if tag and tag.lower() not in {
+                  x.lower() for x in final_tags
               }:
-                  tags.insert(0, tag)
+                  final_tags.append(tag)
+              if len(final_tags) >= 5:
+                  break
 
-          tags = tags[:6]
+          tags = final_tags
 
           if MODE == "article":
               body = clean(
@@ -724,52 +727,13 @@ jobs:
                       "price": None,
                       "change": None,
                       "high": None,
-                      "low": None
+                      "low": None,
+                      "provider": "none",
                   }
 
-              symbol = symbol.upper()
+              symbol = symbol.upper().strip()
 
-              # First: Coinbase public spot price.
-              try:
-                  cb_pair = f"{symbol}-USD"
-                  url = (
-                      "https://api.coinbase.com/v2/prices/"
-                      f"{urllib.parse.quote(cb_pair)}/spot"
-                  )
-                  req = urllib.request.Request(
-                      url,
-                      headers={
-                          "User-Agent":
-                              "Mozilla/5.0 BinanceSquareV4"
-                      }
-                  )
-                  with urllib.request.urlopen(
-                      req,
-                      timeout=12
-                  ) as r:
-                      data = json.load(r)
-
-                  price = float(
-                      data["data"]["amount"]
-                  )
-
-                  return {
-                      "available": True,
-                      "pair": f"${symbol}/USDT",
-                      "price": price,
-                      "change": None,
-                      "high": None,
-                      "low": None
-                  }
-
-              except Exception as e:
-                  print(
-                      "Coinbase ticker failed:",
-                      type(e).__name__,
-                      e
-                  )
-
-              # Second: CoinGecko public endpoint.
+              # 1) CoinGecko: broad asset coverage; no API key for this call.
               cg_ids = {
                   "BTC": "bitcoin",
                   "ETH": "ethereum",
@@ -785,72 +749,104 @@ jobs:
                   "TRX": "tron",
                   "DOT": "polkadot",
                   "LTC": "litecoin",
+                  "SHIB": "shiba-inu",
+                  "PEPE": "pepe",
+                  "ATOM": "cosmos",
+                  "UNI": "uniswap",
+                  "AAVE": "aave",
               }
 
               coin_id = cg_ids.get(symbol)
-
               if coin_id:
                   try:
                       url = (
-                          "https://api.coingecko.com/api/v3/"
-                          "simple/price?"
+                          "https://api.coingecko.com/api/v3/simple/price?"
                           + urllib.parse.urlencode({
                               "ids": coin_id,
                               "vs_currencies": "usd",
-                              "include_24hr_change": "true"
+                              "include_24hr_change": "true",
+                              "include_24hr_high": "true",
+                              "include_24hr_low": "true",
                           })
                       )
 
-                      with urllib.request.urlopen(
-                          urllib.request.Request(
-                              url,
-                              headers={
-                                  "User-Agent":
-                                      "Mozilla/5.0 BinanceSquareV4"
-                              }
-                          ),
-                          timeout=12
-                      ) as r:
-                          data = json.load(r)
-
-                      row = data.get(
-                          coin_id,
-                          {}
+                      req = urllib.request.Request(
+                          url,
+                          headers={
+                              "User-Agent": "Mozilla/5.0 BinanceSquareV4.1"
+                          },
                       )
+
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          row = json.load(r).get(coin_id, {})
 
                       price = row.get("usd")
-                      change = row.get(
-                          "usd_24h_change"
-                      )
+                      change = row.get("usd_24h_change")
+                      high = row.get("usd_24h_high")
+                      low = row.get("usd_24h_low")
 
                       if price is not None:
                           return {
                               "available": True,
                               "pair": f"${symbol}/USDT",
                               "price": float(price),
-                              "change": (
-                                  float(change)
-                                  if change is not None
-                                  else None
-                              ),
-                              "high": None,
-                              "low": None
+                              "change": float(change) if change is not None else None,
+                              "high": float(high) if high is not None else None,
+                              "low": float(low) if low is not None else None,
+                              "provider": "CoinGecko",
                           }
 
-                  except Exception as e:
+                  except Exception as exc:
                       print(
                           "CoinGecko failed:",
-                          type(e).__name__,
-                          e
+                          type(exc).__name__,
+                          exc,
                       )
+
+              # 2) Coinbase fallback for common USD pairs.
+              try:
+                  url = (
+                      "https://api.coinbase.com/v2/prices/"
+                      f"{urllib.parse.quote(symbol)}-USD/spot"
+                  )
+
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "Mozilla/5.0 BinanceSquareV4.1"
+                      },
+                  )
+
+                  with urllib.request.urlopen(req, timeout=12) as r:
+                      data = json.load(r)
+
+                  price = float(data["data"]["amount"])
+
+                  return {
+                      "available": True,
+                      "pair": f"${symbol}/USDT",
+                      "price": price,
+                      "change": None,
+                      "high": None,
+                      "low": None,
+                      "provider": "Coinbase",
+                  }
+
+              except Exception as exc:
+                  print(
+                      "Coinbase failed:",
+                      type(exc).__name__,
+                      exc,
+                  )
 
               return {
                   "available": False,
-                  "pair": "",
+                  "pair": f"${symbol}/USDT",
                   "price": None,
                   "change": None,
                   "high": None,
-                  "low": None
+                  "low": None,
+                  "provider": "none",
               }
 
           market = market_data(coin)
@@ -1756,7 +1752,7 @@ jobs:
           )
 
           tag_x = 165
-          for tag in tags[:6]:
+          for tag in tags[:5]:
               width = draw.textbbox(
                   (0, 0),
                   tag,
@@ -1871,7 +1867,7 @@ jobs:
 
           print("")
           print("============================================")
-          print("BINANCE SQUARE V4 READY")
+          print("BINANCE SQUARE V4.1 READY")
           print("============================================")
           print("Mode:", MODE)
           print("Gemini:", model_used)
@@ -1895,6 +1891,8 @@ jobs:
 
       - name: Publish to Binance Square
         shell: bash
+        env:
+          BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
         run: |
           set -euo pipefail
 
