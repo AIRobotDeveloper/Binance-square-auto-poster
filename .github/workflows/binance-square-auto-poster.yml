@@ -1,10 +1,10 @@
-name: Binance Square Auto Publisher V2
+name: Binance Square Auto Publisher V2.1
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Choose what to publish"
+        description: Choose what to publish
         required: true
         type: choice
         default: auto
@@ -15,13 +15,11 @@ on:
           - article
 
   schedule:
-    # 09:05 Pakistan time
+    # 09:05 Pakistan time (UTC+5)
     - cron: "5 4 * * *"
-
-    # 14:05 Pakistan time
+    # 14:05 Pakistan time (UTC+5)
     - cron: "5 9 * * *"
-
-    # 20:05 Pakistan time
+    # 20:05 Pakistan time (UTC+5)
     - cron: "5 15 * * *"
 
 permissions:
@@ -39,33 +37,22 @@ jobs:
       SCHEDULE_EXPRESSION: ${{ github.event.schedule }}
 
     steps:
-
-      # ---------------------------------------------------------
-      # 1. Decide which content mode to run
-      # ---------------------------------------------------------
       - name: Select content mode
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          MODE="${REQUESTED_MODE:-}"
 
-          MODE="$REQUESTED_MODE"
-
-          if [ -z "$MODE" ] || [ "$MODE" = "auto" ]; then
-            case "$SCHEDULE_EXPRESSION" in
-              "5 4 * * *")
-                MODE="news"
-                ;;
-              "5 9 * * *")
-                MODE="education"
-                ;;
-              "5 15 * * *")
-                MODE="article"
-                ;;
+          if [[ -z "$MODE" || "$MODE" == "auto" ]]; then
+            case "${SCHEDULE_EXPRESSION:-}" in
+              "5 4 * * *") MODE="news" ;;
+              "5 9 * * *") MODE="education" ;;
+              "5 15 * * *") MODE="article" ;;
               *)
                 HOUR=$(TZ=Asia/Karachi date +%H)
-
-                if [ "$HOUR" -lt 12 ]; then
+                if (( HOUR < 12 )); then
                   MODE="news"
-                elif [ "$HOUR" -lt 18 ]; then
+                elif (( HOUR < 18 )); then
                   MODE="education"
                 else
                   MODE="article"
@@ -74,22 +61,36 @@ jobs:
             esac
           fi
 
-          echo "Selected mode: $MODE"
-          echo "$MODE" > mode.txt
+          case "$MODE" in
+            news|education|article) ;;
+            *) echo "Invalid mode: $MODE"; exit 1 ;;
+          esac
 
-      # ---------------------------------------------------------
-      # 2. Install image-generation dependency
-      # ---------------------------------------------------------
-      - name: Install Pillow
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
+          printf '%s' "$MODE" > mode.txt
+          echo "Selected mode: $MODE"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install image tools
+        shell: bash
         run: |
+          set -euo pipefail
           python3 -m pip install --disable-pip-version-check --no-cache-dir Pillow
 
-      # ---------------------------------------------------------
-      # 3. Collect news + generate content
-      # ---------------------------------------------------------
       - name: Generate AI content
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
+          if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+            echo "GEMINI_API_KEY is missing."
+            exit 1
+          fi
 
           python3 - <<'PY'
           import datetime as dt
@@ -99,20 +100,16 @@ jobs:
           import os
           import re
           import socket
+          import time
           import urllib.error
           import urllib.request
           import xml.etree.ElementTree as ET
-          from collections import Counter
 
-          GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+          API_KEY = os.environ["GEMINI_API_KEY"].strip()
+          MODE = open("mode.txt", encoding="utf-8").read().strip()
 
-          if not GEMINI_API_KEY:
-              raise SystemExit("GEMINI_API_KEY is missing.")
-
-          with open("mode.txt", "r", encoding="utf-8") as f:
-              mode = f.read().strip()
-
-          # Current Gemini fallback chain.
+          # Ordered fallback chain. The workflow never publishes multiple
+          # posts for one run: the first successful model is used.
           MODELS = [
               "gemini-3.5-flash-lite",
               "gemini-3.7-flash",
@@ -120,90 +117,51 @@ jobs:
           ]
 
           RSS_FEEDS = [
-              (
-                  "CoinDesk",
-                  "https://www.coindesk.com/arc/outboundfeeds/rss/"
-              ),
-              (
-                  "Cointelegraph",
-                  "https://cointelegraph.com/rss"
-              ),
-              (
-                  "Decrypt",
-                  "https://decrypt.co/feed"
-              ),
-              (
-                  "The Block",
-                  "https://www.theblock.co/rss.xml"
-              ),
-              (
-                  "Bitcoin Magazine",
-                  "https://bitcoinmagazine.com/.rss/full/"
-              ),
+              ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+              ("Cointelegraph", "https://cointelegraph.com/rss"),
+              ("Decrypt", "https://decrypt.co/feed"),
+              ("The Block", "https://www.theblock.co/rss.xml"),
+              ("Bitcoin Magazine", "https://bitcoinmagazine.com/.rss/full/"),
+              ("Google News Crypto", "https://news.google.com/rss/search?q=crypto%20bitcoin%20ethereum&hl=en-US&gl=US&ceid=US:en"),
           ]
 
-          CRYPTO_KEYWORDS = {
-              "bitcoin",
-              "btc",
-              "ethereum",
-              "eth",
-              "binance",
-              "bnb",
-              "solana",
-              "sol",
-              "stablecoin",
-              "defi",
-              "etf",
-              "regulation",
-              "sec",
-              "fed",
-              "blockchain",
-              "crypto",
-              "digital asset",
-              "token",
-              "hack",
-              "exploit",
-              "security",
-              "exchange",
-              "wallet",
-              "layer 2",
-              "web3",
-              "institutional",
-              "mining",
-              "staking",
-          }
+          # Deterministic pair mapping avoids inventing random trading pairs.
+          PAIR_RULES = [
+              (("bitcoin", "btc"), "BTC/USDT", "BTC"),
+              (("ethereum", "eth"), "ETH/USDT", "ETH"),
+              (("bnb", "binance coin"), "BNB/USDT", "BNB"),
+              (("solana", "sol"), "SOL/USDT", "SOL"),
+              (("xrp", "ripple"), "XRP/USDT", "XRP"),
+              (("dogecoin", "doge"), "DOGE/USDT", "DOGE"),
+              (("cardano", "ada"), "ADA/USDT", "ADA"),
+              (("avalanche", "avax"), "AVAX/USDT", "AVAX"),
+              (("chainlink", "link"), "LINK/USDT", "LINK"),
+              (("tron", "trx"), "TRX/USDT", "TRX"),
+              (("toncoin", "ton"), "TON/USDT", "TON"),
+              (("sui",), "SUI/USDT", "SUI"),
+              (("shiba inu", "shib"), "SHIB/USDT", "SHIB"),
+              (("polkadot", "dot"), "DOT/USDT", "DOT"),
+              (("uniswap", "uni"), "UNI/USDT", "UNI"),
+          ]
 
-          STOPWORDS = {
-              "the", "a", "an", "and", "or", "of", "to", "in", "on",
-              "for", "with", "as", "by", "from", "at", "is", "are",
-              "was", "were", "this", "that", "into", "after", "before",
-              "over", "under", "new", "news"
-          }
+          HASHTAG_RULES = [
+              (("bitcoin", "btc"), ["#Bitcoin", "#BTC", "#Crypto"]),
+              (("ethereum", "eth"), ["#Ethereum", "#ETH", "#Crypto"]),
+              (("bnb", "binance"), ["#BNB", "#Binance", "#Crypto"]),
+              (("solana", "sol"), ["#Solana", "#SOL", "#Crypto"]),
+              (("xrp", "ripple"), ["#XRP", "#Ripple", "#Crypto"]),
+              (("defi",), ["#DeFi", "#Blockchain", "#Crypto"]),
+              (("regulation", "sec", "law"), ["#CryptoRegulation", "#Blockchain", "#Crypto"]),
+              (("stablecoin",), ["#Stablecoins", "#DeFi", "#Crypto"]),
+              (("security", "hack", "exploit"), ["#CryptoSecurity", "#Blockchain", "#Crypto"]),
+          ]
 
           def clean_text(value):
-              if value is None:
-                  return ""
-
-              value = html.unescape(value)
-
-              value = re.sub(
-                  r"<script[^>]*>.*?</script>",
-                  " ",
-                  value,
-                  flags=re.I | re.S,
-              )
-
-              value = re.sub(
-                  r"<style[^>]*>.*?</style>",
-                  " ",
-                  value,
-                  flags=re.I | re.S,
-              )
-
+              value = html.unescape(value or "")
+              value = re.sub(r"<script[^>]*>.*?</script>", " ", value, flags=re.I | re.S)
+              value = re.sub(r"<style[^>]*>.*?</style>", " ", value, flags=re.I | re.S)
               value = re.sub(r"<[^>]+>", " ", value)
-              value = re.sub(r"\s+", " ", value)
-
-              return value.strip()
+              return re.sub(r"\s+", " ", value).strip()
 
           def local_name(tag):
               return tag.split("}", 1)[-1]
@@ -211,1198 +169,572 @@ jobs:
           def child_text(element, wanted):
               for child in element:
                   if local_name(child.tag).lower() == wanted.lower():
-                      return clean_text(child.text or "")
+                      return clean_text(child.text)
               return ""
 
           def parse_date(value):
               if not value:
                   return dt.datetime.now(dt.timezone.utc)
-
               try:
-                  parsed = email.utils.parsedate_to_datetime(value)
-
-                  if parsed.tzinfo is None:
-                      parsed = parsed.replace(tzinfo=dt.timezone.utc)
-
-                  return parsed.astimezone(dt.timezone.utc)
-
+                  d = email.utils.parsedate_to_datetime(value)
+                  return (d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)).astimezone(dt.timezone.utc)
               except Exception:
                   return dt.datetime.now(dt.timezone.utc)
 
-          def fetch_feed(source, feed_url):
+          def fetch_feed(source, url):
               request = urllib.request.Request(
-                  feed_url,
+                  url,
                   headers={
-                      "User-Agent":
-                          "Mozilla/5.0 BinanceSquareAutoPublisher/2.0"
+                      "User-Agent": "Mozilla/5.0 BinanceSquareAutoPublisher/2.1",
+                      "Accept": "application/rss+xml, application/xml, text/xml, */*",
                   },
               )
-
               try:
-                  with urllib.request.urlopen(
-                      request,
-                      timeout=20
-                  ) as response:
+                  with urllib.request.urlopen(request, timeout=15) as response:
                       raw = response.read()
-
                   root = ET.fromstring(raw)
-
-                  entries = []
-
-                  # RSS
-                  for element in root.iter():
-                      if local_name(element.tag).lower() == "item":
-
-                          title = child_text(element, "title")
-                          link = child_text(element, "link")
-                          description = (
-                              child_text(element, "description")
-                              or child_text(element, "summary")
-                          )
-                          published = (
-                              child_text(element, "pubDate")
-                              or child_text(element, "published")
-                              or child_text(element, "updated")
-                          )
-
-                          if title and link:
-                              entries.append({
-                                  "source": source,
-                                  "title": title,
-                                  "url": link,
-                                  "summary": description[:700],
-                                  "published": parse_date(published),
-                              })
-
-                  # Atom fallback
-                  if not entries:
-                      for element in root.iter():
-                          if local_name(element.tag).lower() == "entry":
-
-                              title = child_text(element, "title")
-                              summary = (
-                                  child_text(element, "summary")
-                                  or child_text(element, "content")
-                              )
-                              published = (
-                                  child_text(element, "published")
-                                  or child_text(element, "updated")
-                              )
-
-                              link = ""
-
-                              for child in element:
-                                  if local_name(child.tag).lower() == "link":
-                                      href = child.attrib.get("href", "")
-                                      if href:
-                                          link = href
-                                          break
-
-                              if title and link:
-                                  entries.append({
-                                      "source": source,
-                                      "title": title,
-                                      "url": link,
-                                      "summary": summary[:700],
-                                      "published": parse_date(published),
-                                  })
-
-                  return entries
-
               except Exception as exc:
-                  print(
-                      f"Feed failed: {source}: "
-                      f"{type(exc).__name__}: {exc}"
-                  )
+                  print(f"Feed failed: {source}: {type(exc).__name__}: {exc}")
                   return []
 
-          def normalize_tokens(text):
-              text = re.sub(r"[^a-zA-Z0-9$]+", " ", text.lower())
+              items = []
 
-              return {
-                  token
-                  for token in text.split()
-                  if len(token) > 2 and token not in STOPWORDS
-              }
+              # RSS items
+              for element in root.iter():
+                  if local_name(element.tag).lower() != "item":
+                      continue
+                  title = child_text(element, "title")
+                  link = child_text(element, "link")
+                  desc = child_text(element, "description") or child_text(element, "summary")
+                  published = child_text(element, "pubDate") or child_text(element, "published") or child_text(element, "updated")
+                  if title and link:
+                      items.append({
+                          "source": source,
+                          "title": title,
+                          "summary": desc[:900],
+                          "url": link,
+                          "published": parse_date(published),
+                      })
 
-          def relevance_score(item, now):
-              age_hours = max(
-                  0.0,
-                  (now - item["published"]).total_seconds() / 3600
-              )
+              # Atom entries fallback
+              if not items:
+                  for element in root.iter():
+                      if local_name(element.tag).lower() != "entry":
+                          continue
+                      title = child_text(element, "title")
+                      summary = child_text(element, "summary") or child_text(element, "content")
+                      published = child_text(element, "published") or child_text(element, "updated")
+                      link = ""
+                      for child in element:
+                          if local_name(child.tag).lower() == "link" and child.attrib.get("href"):
+                              link = child.attrib["href"]
+                              break
+                      if title and link:
+                          items.append({
+                              "source": source,
+                              "title": title,
+                              "summary": summary[:900],
+                              "url": link,
+                              "published": parse_date(published),
+                          })
+              return items
 
-              recency = max(0.0, 48.0 - age_hours)
+          def token_set(text):
+              return set(re.findall(r"[a-z0-9$]+", text.lower()))
 
-              blob = (
-                  item["title"] + " " + item["summary"]
-              ).lower()
+          def choose_pair(text):
+              blob = text.lower()
+              for words, pair, ticker in PAIR_RULES:
+                  if any(w in blob for w in words):
+                      return pair, ticker
+              return "BTC/USDT", "BTC"
 
-              keyword_score = 0
+          def choose_hashtags(text, mode):
+              blob = text.lower()
+              for words, tags in HASHTAG_RULES:
+                  if any(w in blob for w in words):
+                      base = tags[:]
+                      break
+              else:
+                  base = ["#Crypto", "#Blockchain", "#BinanceSquare"]
 
-              for keyword in CRYPTO_KEYWORDS:
-                  if keyword in blob:
-                      keyword_score += 2
+              if mode == "news" and "#CryptoNews" not in base:
+                  base[-1] = "#CryptoNews"
+              if mode == "education":
+                  base = ["#CryptoEducation", "#Blockchain", "#BinanceSquare"]
+              return base[:3]
 
-              source_bonus = {
-                  "CoinDesk": 5,
-                  "Cointelegraph": 4,
-                  "Decrypt": 4,
-                  "The Block": 5,
-                  "Bitcoin Magazine": 3,
-              }.get(item["source"], 1)
-
-              return recency + keyword_score + source_bonus
-
-          def get_news():
+          def gather_news():
               now = dt.datetime.now(dt.timezone.utc)
-
+              cutoff = now - dt.timedelta(hours=48)
               all_items = []
 
               for source, url in RSS_FEEDS:
-                  items = fetch_feed(source, url)
-                  all_items.extend(items)
+                  all_items.extend(fetch_feed(source, url))
 
-              print(f"Collected {len(all_items)} feed items.")
+              # Remove duplicates and stale stories.
+              unique = []
+              seen = set()
+              for item in all_items:
+                  if item["url"] in seen:
+                      continue
+                  seen.add(item["url"])
+                  if item["published"] >= cutoff:
+                      unique.append(item)
 
-              if not all_items:
-                  return []
+              if not unique:
+                  unique = list({i["url"]: i for i in all_items}.values())
 
-              # Keep recent items first.
-              recent_cutoff = now - dt.timedelta(hours=48)
-
-              recent = [
-                  item
-                  for item in all_items
-                  if item["published"] >= recent_cutoff
+              crypto_terms = [
+                  "bitcoin", "btc", "ethereum", "eth", "bnb", "binance", "solana",
+                  "xrp", "crypto", "blockchain", "defi", "stablecoin", "etf", "sec",
+                  "regulation", "hack", "exploit", "wallet", "exchange", "token",
               ]
 
-              if not recent:
-                  recent = all_items
-
-              # Remove duplicate URLs.
-              seen_urls = set()
-              unique = []
-
-              for item in recent:
-                  if item["url"] in seen_urls:
-                      continue
-
-                  seen_urls.add(item["url"])
-                  unique.append(item)
-
-              # Score items.
-              for item in unique:
-                  item["score"] = relevance_score(item, now)
-
-              unique.sort(
-                  key=lambda x: x["score"],
-                  reverse=True,
-              )
-
-              # Light cross-source clustering.
-              clusters = []
+              def score(item):
+                  blob = (item["title"] + " " + item["summary"]).lower()
+                  keyword = sum(2 for term in crypto_terms if term in blob)
+                  age_hours = max(0.0, (now - item["published"]).total_seconds() / 3600)
+                  recency = max(0.0, 48.0 - age_hours)
+                  return recency + keyword * 3
 
               for item in unique:
-                  item_tokens = normalize_tokens(item["title"])
-
-                  best_cluster = None
-                  best_overlap = 0.0
-
-                  for cluster in clusters:
-                      cluster_tokens = cluster["tokens"]
-
-                      if not item_tokens or not cluster_tokens:
-                          continue
-
-                      intersection = len(
-                          item_tokens & cluster_tokens
-                      )
-
-                      union = len(
-                          item_tokens | cluster_tokens
-                      )
-
-                      overlap = intersection / max(union, 1)
-
-                      if overlap > best_overlap:
-                          best_overlap = overlap
-                          best_cluster = cluster
-
-                  if best_cluster is not None and best_overlap >= 0.45:
-                      best_cluster["items"].append(item)
-                      best_cluster["tokens"] |= item_tokens
-                  else:
-                      clusters.append({
-                          "items": [item],
-                          "tokens": set(item_tokens),
-                      })
-
-              # Rank clusters by source diversity + recency.
-              ranked_clusters = []
-
-              for cluster in clusters:
-                  source_count = len(
-                      {
-                          item["source"]
-                          for item in cluster["items"]
-                      }
-                  )
-
-                  cluster_score = max(
-                      item["score"]
-                      for item in cluster["items"]
-                  )
-
-                  cluster_score += source_count * 15
-
-                  ranked_clusters.append(
-                      (
-                          cluster_score,
-                          source_count,
-                          cluster,
-                      )
-                  )
-
-              ranked_clusters.sort(
-                  key=lambda x: (x[0], x[1]),
-                  reverse=True,
-              )
-
-              final_items = []
-
-              for _, _, cluster in ranked_clusters:
-                  cluster_items = sorted(
-                      cluster["items"],
-                      key=lambda x: x["published"],
-                      reverse=True,
-                  )
-
-                  for item in cluster_items[:2]:
-                      final_items.append(item)
-
-                  if len(final_items) >= 10:
-                      break
-
-              return final_items[:10]
-
-          def save_file(path, value):
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(value.strip())
+                  item["score"] = score(item)
+              unique.sort(key=lambda x: x["score"], reverse=True)
+              return unique[:12]
 
           def extract_json(text):
-              text = text.strip()
-
-              text = re.sub(
-                  r"^```(?:json)?\s*",
-                  "",
-                  text,
-                  flags=re.I,
-              )
-
-              text = re.sub(
-                  r"\s*```$",
-                  "",
-                  text,
-              )
-
-              start = text.find("{")
-              end = text.rfind("}")
-
+              text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.I)
+              text = re.sub(r"\s*```$", "", text)
+              start, end = text.find("{"), text.rfind("}")
               if start == -1 or end == -1:
-                  raise ValueError(
-                      "No JSON object found in Gemini response."
-                  )
-
+                  raise ValueError("Gemini did not return a JSON object.")
               return json.loads(text[start:end + 1])
 
-          def call_gemini(prompt, max_output_tokens=1200):
-              errors = []
-
+          def gemini(prompt, max_tokens=1400):
+              last_errors = []
               for model in MODELS:
-
                   print(f"Trying Gemini model: {model}")
-
-                  url = (
-                      "https://generativelanguage.googleapis.com/"
-                      f"v1beta/models/{model}:generateContent"
-                  )
-
+                  url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                   body = {
-                      "contents": [
-                          {
-                              "parts": [
-                                  {
-                                      "text": prompt
-                                  }
-                              ]
-                          }
-                      ],
+                      "contents": [{"parts": [{"text": prompt}]}],
                       "generationConfig": {
                           "temperature": 0.75,
-                          "maxOutputTokens": max_output_tokens,
+                          "maxOutputTokens": max_tokens,
                       },
                   }
-
                   request = urllib.request.Request(
                       url,
                       data=json.dumps(body).encode("utf-8"),
                       headers={
                           "Content-Type": "application/json",
-                          "x-goog-api-key": GEMINI_API_KEY,
+                          "x-goog-api-key": API_KEY,
                       },
                       method="POST",
                   )
-
                   try:
-                      with urllib.request.urlopen(
-                          request,
-                          timeout=45
-                      ) as response:
-
+                      with urllib.request.urlopen(request, timeout=45) as response:
                           result = json.load(response)
-
-                      candidates = result.get(
-                          "candidates",
-                          []
-                      )
-
-                      if not candidates:
-                          raise ValueError(
-                              "Gemini returned no candidates."
-                          )
-
-                      parts = candidates[0].get(
-                          "content", {}
-                      ).get("parts", [])
-
-                      generated = "".join(
+                      text = "".join(
                           part.get("text", "")
-                          for part in parts
-                          if isinstance(part, dict)
+                          for part in result.get("candidates", [])[0].get("content", {}).get("parts", [])
                       ).strip()
-
-                      if not generated:
-                          raise ValueError(
-                              "Gemini returned empty text."
-                          )
-
-                      print(
-                          f"SUCCESS with {model}"
-                      )
-
-                      return generated, model
-
+                      if not text:
+                          raise ValueError("Gemini returned empty text")
+                      print(f"SUCCESS with {model}")
+                      return text, model
                   except urllib.error.HTTPError as exc:
-                      detail = exc.read().decode(
-                          "utf-8",
-                          errors="replace",
-                      )
-
-                      message = (
-                          f"{model}: HTTP {exc.code} "
-                          f"{detail[:700]}"
-                      )
-
-                      print(message)
-                      errors.append(message)
-
-                  except (
-                      TimeoutError,
-                      socket.timeout,
-                  ) as exc:
-
-                      message = (
-                          f"{model}: timeout: {exc}"
-                      )
-
-                      print(message)
-                      errors.append(message)
-
+                      detail = exc.read().decode("utf-8", errors="replace")
+                      msg = f"{model}: HTTP {exc.code}: {detail[:500]}"
+                      print(msg)
+                      last_errors.append(msg)
+                      if exc.code in {429, 500, 502, 503, 504}:
+                          time.sleep(2)
+                  except (TimeoutError, socket.timeout) as exc:
+                      msg = f"{model}: timeout: {exc}"
+                      print(msg)
+                      last_errors.append(msg)
                   except Exception as exc:
+                      msg = f"{model}: {type(exc).__name__}: {exc}"
+                      print(msg)
+                      last_errors.append(msg)
+              raise SystemExit("All Gemini models failed:\n" + "\n".join(last_errors))
 
-                      message = (
-                          f"{model}: "
-                          f"{type(exc).__name__}: {exc}"
-                      )
+          def add_metadata(base, pair, tags, max_chars=480):
+              base = re.sub(r"\s+", " ", base.strip())
+              base = re.sub(r"(?:#\w+\s*)+$", "", base).strip()
+              metadata = f"\n\n📊 Pair: {pair}\n{' '.join(tags)}"
+              available = max_chars - len(metadata)
+              if len(base) > available:
+                  base = base[:max(available - 1, 1)].rstrip(" .,;:") + "…"
+              return base + metadata
 
-                      print(message)
-                      errors.append(message)
+          news = gather_news() if MODE in {"news", "article"} else []
+          news_json = json.dumps([
+              {
+                  "source": x["source"],
+                  "title": x["title"],
+                  "summary": x["summary"],
+                  "published_utc": x["published"].isoformat(),
+                  "url": x["url"],
+              }
+              for x in news
+          ], ensure_ascii=False, indent=2)
 
-              raise SystemExit(
-                  "All Gemini models failed:\n"
-                  + "\n".join(errors)
-              )
-
-          def generate_news(news_items):
-
-              if not news_items:
-                  return None
-
-              news_payload = []
-
-              for index, item in enumerate(news_items, 1):
-                  news_payload.append({
-                      "id": index,
-                      "source": item["source"],
-                      "title": item["title"],
-                      "published_utc": item[
-                          "published"
-                      ].isoformat(),
-                      "summary": item["summary"],
-                      "url": item["url"],
-                  })
-
-              payload_text = json.dumps(
-                  news_payload,
-                  ensure_ascii=False,
-                  indent=2,
-              )
-
-              now_pkt = (
-                  dt.datetime.now(
-                      dt.timezone.utc
-                  )
-                  + dt.timedelta(hours=5)
-              )
-
+          if MODE == "news":
               prompt = f"""
-          You are the editorial engine for a Binance Square crypto account.
+          You are the editor of a professional Binance Square crypto account.
 
-          Current Pakistan date/time:
-          {now_pkt.isoformat()}
+          Current date/time in Pakistan: {dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)}
 
-          Below is fresh crypto news collected from public RSS feeds.
+          Here are fresh crypto headlines from public RSS feeds:
+          {news_json}
 
-          NEWS DATA:
-          {payload_text}
+          Choose ONE strongest and most useful current story.
+          Do not invent facts, quotes, statistics, prices, partnerships, or events.
+          Clearly mark a report/rumor as reported or unconfirmed when necessary.
+          Do not give financial advice, buy/sell instructions, profit promises, or price targets.
 
-          Select ONE strongest story.
+          Write a substantial but readable short post: target 300-360 characters BEFORE the
+          pair line and hashtags. Use 2-4 short paragraphs or bullets when helpful.
 
-          Selection rules:
-          - Prefer recent, important crypto/blockchain news.
-          - Prefer stories covered by more than one source.
-          - Never invent facts.
-          - Never turn an unconfirmed report into a confirmed fact.
-          - If a story is only reported by one source, use wording such
-            as "reported by..." when appropriate.
-          - Ignore promotional giveaways, obvious spam and low-value stories.
-          - Do not create investment advice.
-          - Do not make price predictions.
-
-          Return ONLY valid JSON:
-
+          Return ONLY JSON:
           {{
-            "title": "short article title",
-            "short_post": "maximum 380 characters, engaging but factual",
-            "image_headline": "maximum 55 characters",
-            "image_subtitle": "maximum 100 characters",
-            "hashtags": ["#CryptoNews", "#Bitcoin", "#Blockchain"]
+            "title": "headline",
+            "post": "300-360 character post without hashtags and without a pair line",
+            "image_headline": "short strong headline",
+            "image_subtitle": "one concise factual subtitle",
+            "pair": "choose exactly one relevant pair from BTC/USDT, ETH/USDT, BNB/USDT, SOL/USDT, XRP/USDT, DOGE/USDT, ADA/USDT, AVAX/USDT, LINK/USDT, TRX/USDT, TON/USDT, SUI/USDT, SHIB/USDT, DOT/USDT, UNI/USDT"
           }}
-
-          The short post must:
-          - be under 380 characters;
-          - contain no guaranteed profit claims;
-          - contain no buy/sell instruction;
-          - contain no fake numbers;
-          - use at most 3 hashtags.
           """
+              raw, model = gemini(prompt, 850)
+              data = extract_json(raw)
+              title = str(data.get("title", "Crypto News")).strip()
+              post = str(data.get("post", "")).strip()
+              headline = str(data.get("image_headline", title)).strip()
+              subtitle = str(data.get("image_subtitle", "Latest verified crypto update")).strip()
+              pair = str(data.get("pair", "BTC/USDT")).strip()
+              if pair not in {x[1] for x in PAIR_RULES}:
+                  pair = choose_pair(title + " " + post)[0]
+              tags = choose_hashtags(title + " " + post, "news")
+              final_post = add_metadata(post, pair, tags)
 
-              for attempt in range(2):
-                  try:
-                      generated, model = call_gemini(
-                          prompt,
-                          max_output_tokens=700,
-                      )
+              # Use the selected story link as the primary source.
+              primary = news[0]["url"] if news else ""
+              sources = []
+              if primary:
+                  sources.append(primary)
+              for item in news:
+                  if item["url"] not in sources and len(sources) < 4:
+                      sources.append(item["url"])
 
-                      data = extract_json(generated)
+              open("post.txt", "w", encoding="utf-8").write(final_post)
+              open("content_title.txt", "w", encoding="utf-8").write(title[:120])
+              open("image_headline.txt", "w", encoding="utf-8").write(headline[:90])
+              open("image_subtitle.txt", "w", encoding="utf-8").write(subtitle[:180])
+              open("pair.txt", "w", encoding="utf-8").write(pair)
+              open("hashtags.txt", "w", encoding="utf-8").write(" ".join(tags))
+              open("sources.txt", "w", encoding="utf-8").write("\n".join(sources))
+              open("ai_model.txt", "w", encoding="utf-8").write(model)
 
-                      post = str(
-                          data.get("short_post", "")
-                      ).strip()
-
-                      if not post:
-                          raise ValueError(
-                              "Short post is empty."
-                          )
-
-                      if len(post) > 380:
-                          post = post[:377] + "..."
-
-                      data["short_post"] = post
-                      data["_model"] = model
-
-                      return data
-
-                  except Exception as exc:
-                      print(
-                          "News JSON generation error:",
-                          exc,
-                      )
-
-              return None
-
-          def generate_education():
-
+          elif MODE == "education":
               topics = [
-                  "risk management",
-                  "Bitcoin wallets",
-                  "stablecoins",
-                  "blockchain basics",
-                  "trading psychology",
-                  "spot vs futures",
-                  "self-custody",
-                  "DeFi basics",
-                  "crypto scams",
-                  "on-chain data",
-                  "liquidity",
-                  "market cycles",
-                  "dollar-cost averaging",
-                  "private keys",
-                  "network fees",
+                  ("risk management", "BTC/USDT"),
+                  ("spot vs futures", "BTC/USDT"),
+                  ("wallet security", "BTC/USDT"),
+                  ("stablecoins", "USDT/USDC"),
+                  ("Ethereum gas fees", "ETH/USDT"),
+                  ("BNB ecosystem basics", "BNB/USDT"),
+                  ("Solana fundamentals", "SOL/USDT"),
+                  ("trading psychology", "BTC/USDT"),
+                  ("DeFi basics", "ETH/USDT"),
+                  ("crypto scams and phishing", "BTC/USDT"),
+                  ("self-custody and private keys", "BTC/USDT"),
+                  ("market liquidity", "BTC/USDT"),
               ]
-
-              today = dt.datetime.now(
-                  dt.timezone.utc
-              ).date()
-
-              day_index = today.timetuple().tm_yday
-
-              topic = topics[
-                  day_index % len(topics)
-              ]
+              day = dt.datetime.now(dt.timezone.utc).timetuple().tm_yday
+              topic, default_pair = topics[day % len(topics)]
 
               prompt = f"""
-          Create one original educational Binance Square post.
+          You are a crypto educator writing for Binance Square.
+          Create one genuinely useful educational post about: {topic}
 
-          Topic:
-          {topic}
+          Target 300-360 characters BEFORE the pair line and hashtags.
+          Explain one concept clearly using practical language.
+          No financial advice, profit promises, price targets, or buy/sell instructions.
+          Do not invent statistics.
 
-          Requirements:
-          - Maximum 380 characters.
-          - Teach one useful concept clearly.
-          - Professional and easy to understand.
-          - No financial advice.
-          - No promise of profits.
-          - No buy/sell instruction.
-          - No price prediction.
-          - No fake statistics.
-          - Maximum 3 hashtags.
-
-          Return ONLY valid JSON:
-
+          Return ONLY JSON:
           {{
-            "short_post": "...",
-            "image_headline": "...",
-            "image_subtitle": "...",
-            "hashtags": ["#CryptoEducation", "#Blockchain"]
+            "post": "300-360 character educational post without hashtags or pair line",
+            "image_headline": "short educational headline",
+            "image_subtitle": "one clear takeaway",
+            "pair": "exactly one of BTC/USDT, ETH/USDT, BNB/USDT, SOL/USDT, XRP/USDT"
           }}
           """
+              raw, model = gemini(prompt, 700)
+              data = extract_json(raw)
+              post = str(data.get("post", "")).strip()
+              pair = str(data.get("pair", default_pair)).strip()
+              if pair not in {"BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"}:
+                  pair = default_pair
+              tags = choose_hashtags(topic, "education")
+              final_post = add_metadata(post, pair, tags)
 
-              generated, model = call_gemini(
-                  prompt,
-                  max_output_tokens=500,
-              )
+              open("post.txt", "w", encoding="utf-8").write(final_post)
+              open("content_title.txt", "w", encoding="utf-8").write("Crypto Education")
+              open("image_headline.txt", "w", encoding="utf-8").write(str(data.get("image_headline", topic)).strip()[:90])
+              open("image_subtitle.txt", "w", encoding="utf-8").write(str(data.get("image_subtitle", "Learn one useful concept today")).strip()[:180])
+              open("pair.txt", "w", encoding="utf-8").write(pair)
+              open("hashtags.txt", "w", encoding="utf-8").write(" ".join(tags))
+              open("sources.txt", "w", encoding="utf-8").write("Educational content — no external source required")
+              open("ai_model.txt", "w", encoding="utf-8").write(model)
 
-              data = extract_json(generated)
-
-              post = str(
-                  data.get("short_post", "")
-              ).strip()
-
-              if not post:
-                  raise SystemExit(
-                      "Education post is empty."
-                  )
-
-              data["short_post"] = post[:380]
-              data["_model"] = model
-
-              return data
-
-          def generate_article(news_items):
-
-              if not news_items:
-                  news_items = []
-
-              news_payload = []
-
-              for item in news_items[:10]:
-                  news_payload.append({
-                      "source": item["source"],
-                      "title": item["title"],
-                      "published_utc": item[
-                          "published"
-                      ].isoformat(),
-                      "summary": item["summary"],
-                      "url": item["url"],
-                  })
-
-              payload_text = json.dumps(
-                  news_payload,
-                  ensure_ascii=False,
-                  indent=2,
-              )
-
-              now_pkt = (
-                  dt.datetime.now(
-                      dt.timezone.utc
-                  )
-                  + dt.timedelta(hours=5)
-              )
-
+          elif MODE == "article":
               prompt = f"""
-          You are a crypto research writer creating a Binance Square article.
+          You are a professional crypto research writer for Binance Square.
 
-          Current Pakistan date/time:
-          {now_pkt.isoformat()}
+          Current Pakistan date/time: {dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)}
 
-          Use the supplied recent news feed data as your source material.
+          Recent news material:
+          {news_json}
 
-          NEWS:
-          {payload_text}
-
-          Write ONE useful deep-dive article.
-
-          Rules:
-          - About 2500-4500 characters.
-          - Focus on one meaningful crypto story or theme.
-          - Explain what happened.
-          - Explain why it matters.
-          - Explain the broader context.
-          - Clearly distinguish confirmed facts from reports or uncertainty.
-          - No fabricated statistics.
-          - No fabricated quotations.
-          - No financial advice.
-          - No guaranteed returns.
-          - No price prediction.
-          - Do not tell readers to buy or sell.
-          - Do not copy source wording.
-          - Write an original summary.
-
-          Structure:
-          1. Introduction
-          2. What happened
-          3. Why it matters
+          Select ONE meaningful story or theme and write an original long-form article.
+          Target 2800-4200 characters.
+          Include these sections with clear headings:
+          1. What happened
+          2. Why it matters
+          3. Market context
           4. What to watch next
           5. Conclusion
 
-          Return ONLY valid JSON:
+          Use only facts supported by the supplied source material.
+          Clearly label reports/uncertainty.
+          No fabricated numbers or quotes.
+          No financial advice, buy/sell commands, guaranteed returns, or price predictions.
 
+          Return ONLY JSON:
           {{
             "title": "article title",
-            "article": "complete article body",
+            "article": "full article body",
             "image_headline": "short cover headline",
-            "image_subtitle": "short cover subtitle"
+            "image_subtitle": "short factual cover subtitle",
+            "pair": "one of BTC/USDT, ETH/USDT, BNB/USDT, SOL/USDT, XRP/USDT, DOGE/USDT, ADA/USDT, AVAX/USDT, LINK/USDT, TRX/USDT, TON/USDT, SUI/USDT, SHIB/USDT, DOT/USDT, UNI/USDT"
           }}
           """
+              raw, model = gemini(prompt, 2200)
+              data = extract_json(raw)
+              title = str(data.get("title", "Crypto Deep Dive")).strip()
+              article = str(data.get("article", "")).strip()
+              pair = str(data.get("pair", "BTC/USDT")).strip()
+              if pair not in {x[1] for x in PAIR_RULES}:
+                  pair = choose_pair(title + " " + article)[0]
 
-              generated, model = call_gemini(
-                  prompt,
-                  max_output_tokens=2200,
-              )
+              sources = []
+              for item in news:
+                  if item["url"] not in sources and len(sources) < 5:
+                      sources.append(item["url"])
 
-              data = extract_json(generated)
+              if sources:
+                  article += "\n\nSources\n" + "\n".join(f"{i}. {u}" for i, u in enumerate(sources, 1))
 
-              title = str(
-                  data.get("title", "")
-              ).strip()
+              open("post.txt", "w", encoding="utf-8").write(article[:6000])
+              open("article.txt", "w", encoding="utf-8").write(article[:6000])
+              open("content_title.txt", "w", encoding="utf-8").write(title[:120])
+              open("image_headline.txt", "w", encoding="utf-8").write(str(data.get("image_headline", title)).strip()[:90])
+              open("image_subtitle.txt", "w", encoding="utf-8").write(str(data.get("image_subtitle", pair)).strip()[:180])
+              open("pair.txt", "w", encoding="utf-8").write(pair)
+              open("hashtags.txt", "w", encoding="utf-8").write("#CryptoNews #Blockchain #BinanceSquare")
+              open("sources.txt", "w", encoding="utf-8").write("\n".join(sources))
+              open("ai_model.txt", "w", encoding="utf-8").write(model)
 
-              article = str(
-                  data.get("article", "")
-              ).strip()
-
-              if not title:
-                  raise SystemExit(
-                      "Article title is empty."
-                  )
-
-              if not article:
-                  raise SystemExit(
-                      "Article body is empty."
-                  )
-
-              # Conservative length limit.
-              if len(article) > 5000:
-                  article = article[:5000]
-
-              data["title"] = title[:120]
-              data["article"] = article
-              data["_model"] = model
-
-              return data
-
-          # -----------------------------------------------------
-          # Generate requested content
-          # -----------------------------------------------------
-
-          news_items = []
-
-          if mode in ("news", "article"):
-              news_items = get_news()
-
-          selected_news = news_items[0] if news_items else None
-
-          source_urls = []
-          source_names = []
-
-          if selected_news:
-              source_urls.append(
-                  selected_news["url"]
-              )
-              source_names.append(
-                  selected_news["source"]
-              )
-
-          if news_items:
-              # Add additional distinct sources.
-              for item in news_items:
-                  if item["source"] not in source_names:
-                      source_names.append(
-                          item["source"]
-                      )
-
-                  if (
-                      item["url"] not in source_urls
-                      and len(source_urls) < 4
-                  ):
-                      source_urls.append(
-                          item["url"]
-                      )
-
-          if mode == "news":
-
-              news_data = generate_news(
-                  news_items
-              )
-
-              if news_data is None:
-                  print(
-                      "Fresh news generation failed; "
-                      "using educational fallback."
-                  )
-
-                  mode = "education"
-                  news_data = generate_education()
-
-              data = news_data
-
-              save_file(
-                  "post.txt",
-                  data["short_post"],
-              )
-
-              save_file(
-                  "image_headline.txt",
-                  data.get(
-                      "image_headline",
-                      "CRYPTO NEWS"
-                  ),
-              )
-
-              save_file(
-                  "image_subtitle.txt",
-                  data.get(
-                      "image_subtitle",
-                      "Latest crypto update"
-                  ),
-              )
-
-              if selected_news:
-                  save_file(
-                      "content_title.txt",
-                      data.get(
-                          "title",
-                          selected_news["title"]
-                      ),
-                  )
-              else:
-                  save_file(
-                      "content_title.txt",
-                      "Crypto Update"
-                  )
-
-              save_file(
-                  "source_names.txt",
-                  ", ".join(source_names[:4]),
-              )
-
-          elif mode == "education":
-
-              data = generate_education()
-
-              save_file(
-                  "post.txt",
-                  data["short_post"],
-              )
-
-              save_file(
-                  "image_headline.txt",
-                  data.get(
-                      "image_headline",
-                      "CRYPTO EDUCATION"
-                  ),
-              )
-
-              save_file(
-                  "image_subtitle.txt",
-                  data.get(
-                      "image_subtitle",
-                      "Learn one useful concept today"
-                  ),
-              )
-
-              save_file(
-                  "content_title.txt",
-                  "Crypto Education",
-              )
-
-              save_file(
-                  "source_names.txt",
-                  "Educational content",
-              )
-
-          elif mode == "article":
-
-              article_data = generate_article(
-                  news_items
-              )
-
-              article = article_data["article"]
-
-              # Add original source links collected
-              # from the RSS feeds.
-              if source_urls:
-                  article += "\n\nSources:\n"
-
-                  for index, url in enumerate(
-                      source_urls[:4],
-                      start=1,
-                  ):
-                      article += (
-                          f"{index}. {url}\n"
-                      )
-
-              save_file(
-                  "post.txt",
-                  article[:5000],
-              )
-
-              save_file(
-                  "article.txt",
-                  article[:5000],
-              )
-
-              save_file(
-                  "content_title.txt",
-                  article_data["title"],
-              )
-
-              save_file(
-                  "image_headline.txt",
-                  article_data.get(
-                      "image_headline",
-                      article_data["title"]
-                  ),
-              )
-
-              save_file(
-                  "image_subtitle.txt",
-                  article_data.get(
-                      "image_subtitle",
-                      "Crypto deep dive"
-                  ),
-              )
-
-              save_file(
-                  "source_names.txt",
-                  ", ".join(source_names[:4])
-                  if source_names
-                  else "Crypto news sources",
-              )
-
-          else:
-              raise SystemExit(
-                  f"Unknown mode: {mode}"
-              )
-
-          # Write final mode after fallback decisions.
-          save_file(
-              "mode.txt",
-              mode,
-          )
-
-          print("")
-          print("================================")
-          print("FINAL CONTENT MODE:", mode)
-          print("================================")
-          print("")
-
-          print(
-              open(
-                  "post.txt",
-                  encoding="utf-8"
-              ).read()
-          )
-
-          print("")
-          print(
-              "Sources:",
-              open(
-                  "source_names.txt",
-                  encoding="utf-8"
-              ).read(),
-          )
-
+          print("\n===== FINAL MODE =====")
+          print(MODE)
+          print("===== AI MODEL =====")
+          print(open("ai_model.txt", encoding="utf-8").read())
+          print("===== PAIR =====")
+          print(open("pair.txt", encoding="utf-8").read())
+          print("===== HASHTAGS =====")
+          print(open("hashtags.txt", encoding="utf-8").read())
+          print("===== POST PREVIEW =====")
+          print(open("post.txt", encoding="utf-8").read())
           PY
 
-      # ---------------------------------------------------------
-      # 4. Create an original visual card locally
-      # ---------------------------------------------------------
-      - name: Create automatic image
+      - name: Create high-resolution visual
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           python3 - <<'PY'
-          from PIL import Image, ImageDraw, ImageFont
+          from PIL import Image, ImageDraw, ImageFont, ImageFilter
           import datetime as dt
           import os
           import textwrap
 
-          WIDTH = 1200
-          HEIGHT = 675
-
-          mode = open(
-              "mode.txt",
-              encoding="utf-8"
-          ).read().strip()
-
-          headline = open(
-              "image_headline.txt",
-              encoding="utf-8"
-          ).read().strip()
-
-          subtitle = open(
-              "image_subtitle.txt",
-              encoding="utf-8"
-          ).read().strip()
-
-          sources = open(
-              "source_names.txt",
-              encoding="utf-8"
-          ).read().strip()
+          W, H = 1920, 1080
+          mode = open("mode.txt", encoding="utf-8").read().strip()
+          headline = open("image_headline.txt", encoding="utf-8").read().strip()
+          subtitle = open("image_subtitle.txt", encoding="utf-8").read().strip()
+          pair = open("pair.txt", encoding="utf-8").read().strip()
+          hashtags = open("hashtags.txt", encoding="utf-8").read().strip()
+          sources = open("sources.txt", encoding="utf-8").read().strip().splitlines()
 
           if mode == "news":
-              label = "TRENDING CRYPTO NEWS"
+              label, badge = "TRENDING CRYPTO NEWS", "NEWS"
           elif mode == "article":
-              label = "CRYPTO DEEP DIVE"
+              label, badge = "CRYPTO DEEP DIVE", "ARTICLE"
           else:
-              label = "CRYPTO EDUCATION"
+              label, badge = "CRYPTO EDUCATION", "LEARN"
 
-          image = Image.new(
-              "RGB",
-              (WIDTH, HEIGHT),
-              (15, 20, 32)
-          )
+          # High-quality dark background with a smooth horizontal gradient.
+          img = Image.new("RGB", (W, H))
+          px = img.load()
+          left = (10, 16, 28)
+          right = (22, 30, 52)
+          accent = (52, 181, 246)
 
-          draw = ImageDraw.Draw(image)
+          for x in range(W):
+              t = x / (W - 1)
+              c = tuple(int(left[i] * (1-t) + right[i] * t) for i in range(3))
+              for y in range(H):
+                  px[x, y] = c
 
-          # Decorative blocks
-          draw.rectangle(
-              (0, 0, WIDTH, 18),
-              fill=(35, 150, 220)
-          )
+          draw = ImageDraw.Draw(img, "RGBA")
 
-          draw.rectangle(
-              (0, HEIGHT - 15, WIDTH, HEIGHT),
-              fill=(35, 150, 220)
-          )
+          # Subtle glowing circles and grid.
+          glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+          gd = ImageDraw.Draw(glow, "RGBA")
+          gd.ellipse((1320, -180, 2140, 640), fill=(52, 181, 246, 42))
+          gd.ellipse((-280, 700, 540, 1320), fill=(124, 92, 255, 30))
+          glow = glow.filter(ImageFilter.GaussianBlur(70))
+          img = Image.alpha_composite(img.convert("RGBA"), glow)
+          draw = ImageDraw.Draw(img, "RGBA")
 
-          font_dir = (
-              "/usr/share/fonts/truetype/"
-              "dejavu"
-          )
+          for x in range(0, W, 96):
+              draw.line((x, 0, x, H), fill=(255,255,255,8), width=1)
+          for y in range(0, H, 96):
+              draw.line((0, y, W, y), fill=(255,255,255,8), width=1)
 
-          def font(name, size):
-              path = os.path.join(
-                  font_dir,
-                  name
-              )
+          font_candidates = [
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+          ]
+          regular_candidates = [
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+          ]
 
-              try:
-                  return ImageFont.truetype(
-                      path,
-                      size
-                  )
-              except Exception:
-                  return ImageFont.load_default()
+          def load_font(paths, size):
+              for p in paths:
+                  if os.path.exists(p):
+                      return ImageFont.truetype(p, size)
+              return ImageFont.load_default()
 
-          label_font = font(
-              "DejaVuSans-Bold.ttf",
-              34
-          )
+          label_font = load_font(font_candidates, 42)
+          title_font = load_font(font_candidates, 90)
+          title_font_small = load_font(font_candidates, 72)
+          subtitle_font = load_font(regular_candidates, 38)
+          pair_font = load_font(font_candidates, 42)
+          small_font = load_font(regular_candidates, 25)
+          badge_font = load_font(font_candidates, 28)
 
-          title_font = font(
-              "DejaVuSans-Bold.ttf",
-              64
-          )
+          # Top brand strip.
+          draw.rounded_rectangle((90, 70, 650, 140), radius=24, fill=(255,255,255,14), outline=(255,255,255,28), width=2)
+          draw.text((120, 85), label, font=label_font, fill=(240,248,255,255))
 
-          subtitle_font = font(
-              "DejaVuSans.ttf",
-              34
-          )
+          # Coin/pair badge.
+          draw.rounded_rectangle((1460, 72, 1810, 150), radius=24, fill=(52,181,246,40), outline=(52,181,246,150), width=2)
+          draw.text((1500, 93), pair, font=pair_font, fill=(230,248,255,255))
 
-          small_font = font(
-              "DejaVuSans.ttf",
-              22
-          )
+          # Main title card.
+          card = (90, 215, 1830, 790)
+          draw.rounded_rectangle(card, radius=42, fill=(6,12,24,175), outline=(255,255,255,28), width=2)
 
-          draw.text(
-              (70, 60),
-              label,
-              font=label_font,
-              fill=(240, 245, 250)
-          )
+          # Accent bar.
+          draw.rounded_rectangle((130, 260, 150, 730), radius=10, fill=accent + (255,))
 
-          # Wrap headline.
-          headline_lines = textwrap.wrap(
-              headline,
-              width=25
-          )
+          # Dynamic title wrapping.
+          max_chars = 25 if len(headline) > 25 else 30
+          lines = textwrap.wrap(headline, width=max_chars)
+          tf = title_font if len(lines) <= 2 else title_font_small
+          y = 285
+          for line in lines[:3]:
+              draw.text((205, y), line, font=tf, fill=(255,255,255,255))
+              y += 105 if tf == title_font else 88
 
-          y = 150
+          y += 15
+          for line in textwrap.wrap(subtitle, width=62)[:3]:
+              draw.text((205, y), line, font=subtitle_font, fill=(195,210,228,255))
+              y += 50
 
-          for line in headline_lines[:3]:
-              draw.text(
-                  (70, y),
-                  line,
-                  font=title_font,
-                  fill=(255, 255, 255)
-              )
+          # Footer metadata.
+          pkt = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)
+          date_text = pkt.strftime("%d %b %Y • %I:%M %p PKT")
+          source_text = sources[0][:65] if sources else "Binance Square AI Publisher"
 
-              y += 78
+          draw.rounded_rectangle((205, 665, 710, 738), radius=20, fill=(255,255,255,10))
+          draw.text((230, 683), f"{badge}  •  {date_text}", font=small_font, fill=(175,191,211,255))
 
-          y += 10
+          draw.text((205, 755), source_text, font=small_font, fill=(142,162,187,255))
+          draw.text((205, 805), hashtags[:105], font=small_font, fill=(122,184,230,255))
 
-          subtitle_lines = textwrap.wrap(
-              subtitle,
-              width=55
-          )
+          # Decorative line graph / market motif, purely visual.
+          pts = [(1450, 650), (1520, 590), (1590, 625), (1660, 525), (1730, 555), (1800, 455)]
+          draw.line(pts, fill=(52,181,246,190), width=8, joint="curve")
+          for x, y in pts:
+              draw.ellipse((x-9, y-9, x+9, y+9), fill=(225,245,255,255))
 
-          for line in subtitle_lines[:3]:
-              draw.text(
-                  (70, y),
-                  line,
-                  font=subtitle_font,
-                  fill=(205, 215, 225)
-              )
+          # Bottom right branding.
+          draw.text((1470, 920), "BINANCE SQUARE", font=label_font, fill=(205,220,235,220))
+          draw.text((1470, 975), "AI • NEWS • EDUCATION", font=small_font, fill=(130,155,180,210))
 
-              y += 45
+          # Export at full resolution; additionally create an optimized 1600x900 version.
+          img = img.convert("RGB")
+          img.save("square_visual_1920x1080.png", "PNG", optimize=True)
+          img.resize((1600, 900), Image.Resampling.LANCZOS).save("square_visual.png", "PNG", optimize=True)
+          img.resize((1600, 900), Image.Resampling.LANCZOS).save("article_cover.png", "PNG", optimize=True)
 
-          today = (
-              dt.datetime.now(
-                  dt.timezone.utc
-              )
-              + dt.timedelta(hours=5)
-          ).strftime("%d %b %Y")
-
-          draw.text(
-              (70, 575),
-              f"{today}  •  Binance Square",
-              font=small_font,
-              fill=(170, 185, 200)
-          )
-
-          if sources:
-              source_text = (
-                  "Sources: "
-                  + sources[:120]
-              )
-
-              draw.text(
-                  (70, 615),
-                  source_text,
-                  font=small_font,
-                  fill=(150, 165, 180)
-              )
-
-          # Save one common image.
-          image.save(
-              "square_visual.png",
-              "PNG",
-              optimize=True
-          )
-
-          # Article cover can use the same generated
-          # visual, which keeps the system entirely
-          # API-key free on the image side.
-          image.save(
-              "article_cover.png",
-              "PNG",
-              optimize=True
-          )
-
-          print("Image created successfully.")
-
+          print("Created 1920x1080 master image and 1600x900 upload images.")
           PY
 
-      # ---------------------------------------------------------
-      # 5. Download official Binance Square skill
-      # ---------------------------------------------------------
       - name: Download official Binance Square skill
+        shell: bash
         run: |
-          set -e
-
-          git clone --depth 1 \
-            https://github.com/binance/binance-skills-hub.git
-
+          set -euo pipefail
+          git clone --depth 1 https://github.com/binance/binance-skills-hub.git
           cd binance-skills-hub/skills/binance/square-post
-
           node --version
 
-      # ---------------------------------------------------------
-      # 6. Publish to Binance Square
-      # ---------------------------------------------------------
       - name: Publish to Binance Square
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          if [ -z "$BINANCE_SQUARE_OPENAPI_KEY" ]; then
+          if [[ -z "${BINANCE_SQUARE_OPENAPI_KEY:-}" ]]; then
             echo "BINANCE_SQUARE_OPENAPI_KEY is missing."
             exit 1
           fi
 
-          MODE=$(cat mode.txt)
-
           cd "$GITHUB_WORKSPACE/binance-skills-hub/skills/binance/square-post"
 
-          if [ "$MODE" = "news" ]; then
+          case "$(cat "$GITHUB_WORKSPACE/mode.txt")" in
+            news|education)
+              echo "Publishing image post..."
+              node scripts/post-image.mjs \
+                --text "$(cat "$GITHUB_WORKSPACE/post.txt")" \
+                --images "$GITHUB_WORKSPACE/square_visual.png"
+              ;;
 
-            echo "Publishing TRENDING NEWS image post..."
+            article)
+              echo "Publishing article with cover..."
+              node scripts/post-image.mjs \
+                --text "$(cat "$GITHUB_WORKSPACE/article.txt")" \
+                --title "$(cat "$GITHUB_WORKSPACE/content_title.txt")" \
+                --cover "$GITHUB_WORKSPACE/article_cover.png"
+              ;;
 
-            node scripts/post-image.mjs \
-              --text "$(cat "$GITHUB_WORKSPACE/post.txt")" \
-              --images "$GITHUB_WORKSPACE/square_visual.png"
-
-          elif [ "$MODE" = "education" ]; then
-
-            echo "Publishing EDUCATIONAL image post..."
-
-            node scripts/post-image.mjs \
-              --text "$(cat "$GITHUB_WORKSPACE/post.txt")" \
-              --images "$GITHUB_WORKSPACE/square_visual.png"
-
-          elif [ "$MODE" = "article" ]; then
-
-            echo "Publishing ARTICLE with cover image..."
-
-            node scripts/post-image.mjs \
-              --text "$(cat "$GITHUB_WORKSPACE/article.txt")" \
-              --title "$(cat "$GITHUB_WORKSPACE/content_title.txt")" \
-              --cover "$GITHUB_WORKSPACE/article_cover.png"
-
-          else
-
-            echo "Unknown mode: $MODE"
-            exit 1
-
-          fi
+            *)
+              echo "Unsupported mode."
+              exit 1
+              ;;
+          esac
