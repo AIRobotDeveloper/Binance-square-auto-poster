@@ -31,8 +31,9 @@ jobs:
           import json
           import os
           import urllib.request
+          import urllib.error
 
-          api_key = os.environ["GEMINI_API_KEY"]
+          api_key = os.environ["GEMINI_API_KEY"].strip()
 
           prompt = """
           Write ONE useful and engaging Binance Square post about cryptocurrency
@@ -53,8 +54,7 @@ jobs:
 
           url = (
               "https://generativelanguage.googleapis.com/v1beta/"
-              "models/gemini-2.5-flash-lite:generateContent?key="
-              + api_key
+              "models/gemini-3.8-flash:generateContent"
           )
 
           data = {
@@ -74,14 +74,28 @@ jobs:
           request = urllib.request.Request(
               url,
               data=json.dumps(data).encode("utf-8"),
-              headers={"Content-Type": "application/json"},
+              headers={
+                  "Content-Type": "application/json",
+                  "x-goog-api-key": api_key
+              },
               method="POST"
           )
 
-          with urllib.request.urlopen(request, timeout=60) as response:
-              result = json.load(response)
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as e:
+              detail = e.read().decode("utf-8", errors="replace")
+              print("Gemini HTTP error:", e.code)
+              print(detail[:1500])
+              raise SystemExit(1)
 
-          post = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+          try:
+              post = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+          except (KeyError, IndexError, TypeError):
+              print("Unexpected Gemini response:")
+              print(json.dumps(result)[:2000])
+              raise SystemExit(1)
 
           if not post:
               raise SystemExit("AI generated an empty post.")
@@ -97,7 +111,6 @@ jobs:
           print("Generated post:")
           print(post)
           PY
-
       - name: Download Binance Square skill
         run: |
           git clone --depth 1 \
