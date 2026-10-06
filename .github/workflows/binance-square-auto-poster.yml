@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Generate AI post
+      - name: Generate AI post with automatic Gemini fallback
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -32,8 +32,21 @@ jobs:
           import os
           import urllib.request
           import urllib.error
+          import socket
 
           api_key = os.environ["GEMINI_API_KEY"].strip()
+
+          models = [
+              "gemini-3.5-flash-lite",
+              "gemini-3.1-flash-lite",
+              "gemini-3.8-flash",
+              "Gemini 2.5 Flash Lite",
+              "Gemini 2.5 Flash",
+              "Gemini 3 Flash",
+              "Gemini 3.5 Flash Lite",
+              "Gemini 3.7 Flash",
+              "Gemini 3.6 Flash",
+          ]
 
           prompt = """
           Write ONE useful and engaging Binance Square post about cryptocurrency
@@ -52,11 +65,6 @@ jobs:
           - Return ONLY the post.
           """
 
-          url = (
-              "https://generativelanguage.googleapis.com/v1beta/"
-              "models/gemini-2.5-flash-lite:generateContent"
-          )
-
           data = {
               "contents": [
                   {
@@ -71,44 +79,61 @@ jobs:
               }
           }
 
-          request = urllib.request.Request(
-              url,
-              data=json.dumps(data).encode("utf-8"),
-              headers={
-                  "Content-Type": "application/json",
-                  "x-goog-api-key": api_key
-              },
-              method="POST"
-          )
+          post = None
 
-          try:
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-          except urllib.error.HTTPError as e:
-              detail = e.read().decode("utf-8", errors="replace")
-              print("Gemini HTTP error:", e.code)
-              print(detail[:1500])
-              raise SystemExit(1)
+          for model in models:
+              print(f"Trying Gemini model: {model}")
 
-          try:
-              post = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-          except (KeyError, IndexError, TypeError):
-              print("Unexpected Gemini response:")
-              print(json.dumps(result)[:2000])
-              raise SystemExit(1)
+              url = (
+                  "https://generativelanguage.googleapis.com/v1beta/"
+                  f"models/{model}:generateContent"
+              )
 
-          if not post:
-              raise SystemExit("AI generated an empty post.")
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps(data).encode("utf-8"),
+                  headers={
+                      "Content-Type": "application/json",
+                      "x-goog-api-key": api_key
+                  },
+                  method="POST"
+              )
 
-          if len(post) > 400:
+              try:
+                  with urllib.request.urlopen(request, timeout=45) as response:
+                      result = json.load(response)
+
+                  post = (
+                      result["candidates"][0]["content"]["parts"][0]["text"]
+                      .strip()
+                  )
+
+                  if post and len(post) <= 400:
+                      print(f"SUCCESS with {model}")
+                      break
+
+                  print(f"{model} returned invalid/too-long output.")
+
+              except urllib.error.HTTPError as e:
+                  detail = e.read().decode("utf-8", errors="replace")
+                  print(f"{model} failed with HTTP {e.code}")
+                  print(detail[:700])
+
+              except (TimeoutError, socket.timeout):
+                  print(f"{model} timed out.")
+
+              except Exception as e:
+                  print(f"{model} failed: {type(e).__name__}: {e}")
+
+          if not post or len(post) > 400:
               raise SystemExit(
-                  f"Post is too long: {len(post)} characters."
+                  "All Gemini fallback models failed."
               )
 
           with open("post.txt", "w", encoding="utf-8") as f:
               f.write(post)
 
-          print("Generated post:")
+          print("Final generated post:")
           print(post)
           PY
       - name: Download Binance Square skill
