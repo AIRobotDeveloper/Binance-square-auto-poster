@@ -1,0 +1,120 @@
+name: AI Binance Square Auto Poster
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5 4 * * *"
+    - cron: "5 9 * * *"
+    - cron: "5 15 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Generate AI post
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -e
+
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "GEMINI_API_KEY is missing."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          api_key = os.environ["GEMINI_API_KEY"]
+
+          prompt = """
+          Write ONE useful and engaging Binance Square post about cryptocurrency
+          education, blockchain, trading psychology, risk management, or market
+          awareness.
+
+          Rules:
+          - Maximum 400 characters.
+          - Original and easy to understand.
+          - No guaranteed profits.
+          - No financial advice.
+          - No fake statistics or fake news.
+          - No price predictions.
+          - Professional but engaging.
+          - Maximum 3 hashtags.
+          - Return ONLY the post.
+          """
+
+          url = (
+              "https://generativelanguage.googleapis.com/v1beta/"
+              "models/gemini-2.5-flash-lite:generateContent?key="
+              + api_key
+          )
+
+          data = {
+              "contents": [
+                  {
+                      "parts": [
+                          {"text": prompt}
+                      ]
+                  }
+              ],
+              "generationConfig": {
+                  "temperature": 0.8,
+                  "maxOutputTokens": 180
+              }
+          }
+
+          request = urllib.request.Request(
+              url,
+              data=json.dumps(data).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+
+          with urllib.request.urlopen(request, timeout=60) as response:
+              result = json.load(response)
+
+          post = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+          if not post:
+              raise SystemExit("AI generated an empty post.")
+
+          if len(post) > 400:
+              raise SystemExit(
+                  f"Post is too long: {len(post)} characters."
+              )
+
+          with open("post.txt", "w", encoding="utf-8") as f:
+              f.write(post)
+
+          print("Generated post:")
+          print(post)
+          PY
+
+      - name: Download Binance Square skill
+        run: |
+          git clone --depth 1 \
+            https://github.com/binance/binance-skills-hub.git
+
+      - name: Publish to Binance Square
+        env:
+          BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+        run: |
+          set -e
+
+          if [ -z "$BINANCE_SQUARE_OPENAPI_KEY" ]; then
+            echo "BINANCE_SQUARE_OPENAPI_KEY is missing."
+            exit 1
+          fi
+
+          cd binance-skills-hub/skills/binance/square-post
+
+          node scripts/post-text.mjs \
+            --text "$(cat "$GITHUB_WORKSPACE/post.txt")"
